@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 
 const STORAGE_KEY = 'signin_cards_v1'
 const FILTER_KEY = 'signin_filters_v1'
@@ -47,6 +47,7 @@ function createEmptyCard(preset = {}) {
 
 const cards = ref([])
 const editingId = ref(null)
+const isCreating = ref(false)
 const editingDraft = ref(null)
 const originalSnapshot = ref(null)
 const selectedIds = ref(new Set())
@@ -64,6 +65,8 @@ const filters = ref({
   status: '',
   risk: ''
 })
+
+const editingInProgress = computed(() => isCreating.value || editingId.value !== null)
 
 onMounted(() => {
   try {
@@ -174,37 +177,50 @@ const systemWarnings = computed(() => {
   return w
 })
 
-const filteredCards = computed(() => {
-  let list = [...cards.value].sort((a, b) => a.order - b.order)
-  if (filters.value.session) {
-    list = list.filter(c => c.session === filters.value.session)
-  }
-  if (filters.value.responsible) {
-    list = list.filter(c => c.responsible === filters.value.responsible)
-  }
-  if (filters.value.status) {
-    list = list.filter(c => c.status === filters.value.status)
-  }
-  if (filters.value.risk) {
-    list = list.filter(c => getRiskLevel(c) === filters.value.risk)
-  }
+function matchesFilters(c) {
+  if (filters.value.session && c.session !== filters.value.session) return false
+  if (filters.value.responsible && c.responsible !== filters.value.responsible) return false
+  if (filters.value.status && c.status !== filters.value.status) return false
+  if (filters.value.risk && getRiskLevel(c) !== filters.value.risk) return false
   if (nightMode.value) {
-    list = list.filter(c => {
-      const hasIssue = c.status === 'issue' ||
-        duplicateCardNos.value.has(c.id) ||
-        colorConflicts.value.has(c.id) ||
-        (c.missingCorner && c.missingCorner.trim()) ||
-        (c.recycleNote && c.recycleNote.trim()) ||
-        !c.responsible || !c.responsible.trim()
-      return c.status !== 'recovered' || hasIssue
-    })
+    const hasIssue = c.status === 'issue' ||
+      duplicateCardNos.value.has(c.id) ||
+      colorConflicts.value.has(c.id) ||
+      (c.missingCorner && c.missingCorner.trim()) ||
+      (c.recycleNote && c.recycleNote.trim()) ||
+      !c.responsible || !c.responsible.trim()
+    if (c.status === 'recovered' && !hasIssue) return false
+  }
+  return true
+}
+
+const filteredCards = computed(() => {
+  let list = [...cards.value]
+    .filter(matchesFilters)
+    .sort((a, b) => a.order - b.order)
+  let pinned = null
+  let pinnedId = null
+  if (isCreating.value && editingDraft.value) {
+    pinned = { ...editingDraft.value, __pinned: true, __pinnedLabel: '🔒 新增中（尚未保存）' }
+    pinnedId = pinned.id
+  } else if (editingId.value) {
+    const card = cards.value.find(c => c.id === editingId.value)
+    if (card && !list.some(c => c.id === editingId.value)) {
+      pinned = { ...card, __pinned: true, __pinnedLabel: '🔒 正在编辑（已钉到顶部，不受当前筛选影响）' }
+      pinnedId = pinned.id
+    }
+  }
+  if (pinned) {
+    list = [pinned, ...list.filter(c => c.id !== pinnedId)]
   }
   return list
 })
 
 const hasUnsavedChanges = computed(() => {
-  if (!editingDraft.value || !originalSnapshot.value) return false
-  return JSON.stringify(normalize(editingDraft.value)) !== JSON.stringify(normalize(originalSnapshot.value))
+  if (!editingDraft.value) return false
+  const snap = originalSnapshot.value
+  if (!snap) return true
+  return JSON.stringify(normalize(editingDraft.value)) !== JSON.stringify(normalize(snap))
 })
 
 function normalize(o) {
@@ -226,29 +242,38 @@ const stats = computed(() => ({
   recovering: cards.value.filter(c => c.status === 'recovering').length,
   recovered: cards.value.filter(c => c.status === 'recovered').length,
   issue: cards.value.filter(c => c.status === 'issue').length,
-  showing: filteredCards.value.length
+  showing: filteredCards.value.filter(c => !c.__pinned).length
 }))
 
+const selectableCards = computed(() => filteredCards.value.filter(c => !c.__pinned))
 const allSelected = computed(() => {
-  return filteredCards.value.length > 0 &&
-    filteredCards.value.every(c => selectedIds.value.has(c.id))
+  return selectableCards.value.length > 0 &&
+    selectableCards.value.every(c => selectedIds.value.has(c.id))
 })
 const someSelected = computed(() => {
-  return filteredCards.value.some(c => selectedIds.value.has(c.id)) && !allSelected.value
+  return selectableCards.value.some(c => selectedIds.value.has(c.id)) && !allSelected.value
 })
 const selectedCount = computed(() => {
-  return filteredCards.value.filter(c => selectedIds.value.has(c.id)).length
+  return selectableCards.value.filter(c => selectedIds.value.has(c.id)).length
 })
 
-function addCard(copyFromLast = false) {
-  if (hasUnsavedChanges.value) {
+function requireSavedOrConfirm(andThen, actionDesc = '此操作') {
+  if (editingInProgress.value && hasUnsavedChanges.value) {
     confirmModal.value = {
       title: '有未保存的修改',
-      message: '当前编辑的签到卡还有未保存内容，是否先保存？',
-      onSave: () => { saveEdit(); confirmModal.value = null; addCard(copyFromLast) },
-      onDiscard: () => { cancelEdit(); confirmModal.value = null; addCard(copyFromLast) },
+      message: `${actionDesc}前需要先处理当前编辑的未保存内容。`,
+      onSave: () => { saveEdit(); confirmModal.value = null; andThen?.() },
+      onDiscard: () => { cancelEdit(); confirmModal.value = null; andThen?.() },
       onCancel: () => { confirmModal.value = null }
     }
+    return false
+  }
+  return true
+}
+
+function addCard(copyFromLast = false) {
+  if (editingInProgress.value) {
+    if (!requireSavedOrConfirm(() => addCard(copyFromLast), '新增卡')) return
     return
   }
   const preset = {}
@@ -262,20 +287,22 @@ function addCard(copyFromLast = false) {
   card.order = cards.value.length > 0
     ? Math.max(...cards.value.map(c => c.order)) + 100
     : 100
-  cards.value.push(card)
-  startEdit(card.id)
-  showToast('已新增签到卡', 'success')
+  isCreating.value = true
+  editingDraft.value = card
+  originalSnapshot.value = createEmptyCard(preset)
+  originalSnapshot.value.order = card.order
+  originalSnapshot.value.id = card.id
+  originalSnapshot.value.createdAt = card.createdAt
+  showToast('请填写后保存（取消或刷新不会留下空记录）', 'info')
 }
 
 function startEdit(id) {
-  if (hasUnsavedChanges.value && editingId.value !== id) {
-    confirmModal.value = {
-      title: '有未保存的修改',
-      message: '切换到另一张卡前需要先保存或丢弃当前修改。',
-      onSave: () => { saveEdit(); confirmModal.value = null; startEdit(id) },
-      onDiscard: () => { cancelEdit(); confirmModal.value = null; startEdit(id) },
-      onCancel: () => { confirmModal.value = null }
-    }
+  if (isCreating.value) {
+    if (!requireSavedOrConfirm(() => startEdit(id), '切换到其他卡')) return
+    return
+  }
+  if (editingId.value && editingId.value !== id) {
+    if (!requireSavedOrConfirm(() => startEdit(id), '切换到其他卡')) return
     return
   }
   const card = cards.value.find(c => c.id === id)
@@ -286,32 +313,46 @@ function startEdit(id) {
 }
 
 function saveEdit() {
-  if (!editingId.value || !editingDraft.value) return
-  const idx = cards.value.findIndex(c => c.id === editingId.value)
-  if (idx === -1) return
-  cards.value[idx] = {
-    ...cards.value[idx],
+  if (!editingDraft.value) return
+  const trimmed = {
+    ...editingDraft.value,
     cardNo: (editingDraft.value.cardNo || '').trim(),
     session: (editingDraft.value.session || '').trim(),
-    groupColor: editingDraft.value.groupColor,
-    status: editingDraft.value.status,
     missingCorner: editingDraft.value.missingCorner || '',
     recycleNote: editingDraft.value.recycleNote || '',
     responsible: (editingDraft.value.responsible || '').trim()
   }
+  if (isCreating.value) {
+    cards.value.push({ ...trimmed })
+    showToast('新增并保存成功', 'success')
+  } else {
+    const idx = cards.value.findIndex(c => c.id === editingId.value)
+    if (idx === -1) return
+    cards.value[idx] = { ...cards.value[idx], ...trimmed }
+    showToast('已保存', 'success')
+  }
   editingId.value = null
+  isCreating.value = false
   editingDraft.value = null
   originalSnapshot.value = null
-  showToast('已保存', 'success')
 }
 
 function cancelEdit() {
+  const wasCreating = isCreating.value
   editingId.value = null
+  isCreating.value = false
   editingDraft.value = null
   originalSnapshot.value = null
+  if (wasCreating) {
+    showToast('已取消新增（未留下记录）', 'info')
+  }
 }
 
 function deleteCard(id) {
+  if (isCreating.value) {
+    cancelEdit()
+    return
+  }
   if (editingId.value === id) cancelEdit()
   cards.value = cards.value.filter(c => c.id !== id)
   selectedIds.value.delete(id)
@@ -319,6 +360,10 @@ function deleteCard(id) {
 }
 
 function duplicateCard(id) {
+  if (editingInProgress.value) {
+    if (!requireSavedOrConfirm(() => duplicateCard(id), '复制分组')) return
+    return
+  }
   const src = cards.value.find(c => c.id === id)
   if (!src) return
   const copy = createEmptyCard({
@@ -329,10 +374,14 @@ function duplicateCard(id) {
   })
   copy.order = src.order + 0.5
   cards.value.push(copy)
-  showToast('已复制分组信息', 'success')
+  showToast('已复制（可点击编辑修改卡号）', 'success')
 }
 
 function quickSetStatus(id, status) {
+  if (editingInProgress.value) {
+    showToast('请先完成或取消当前编辑再快速改状态', 'error')
+    return
+  }
   const idx = cards.value.findIndex(c => c.id === id)
   if (idx === -1) return
   cards.value[idx].status = status
@@ -341,6 +390,10 @@ function quickSetStatus(id, status) {
 }
 
 function toggleSelect(id) {
+  if (editingInProgress.value) {
+    showToast('请先完成或取消当前编辑再做批量选择', 'error')
+    return
+  }
   if (selectedIds.value.has(id)) {
     selectedIds.value.delete(id)
     selectedIds.value = new Set(selectedIds.value)
@@ -351,16 +404,24 @@ function toggleSelect(id) {
 }
 
 function toggleSelectAll() {
+  if (editingInProgress.value) {
+    showToast('请先完成或取消当前编辑再做批量操作', 'error')
+    return
+  }
   if (allSelected.value) {
-    filteredCards.value.forEach(c => selectedIds.value.delete(c.id))
+    selectableCards.value.forEach(c => selectedIds.value.delete(c.id))
   } else {
-    filteredCards.value.forEach(c => selectedIds.value.add(c.id))
+    selectableCards.value.forEach(c => selectedIds.value.add(c.id))
   }
   selectedIds.value = new Set(selectedIds.value)
 }
 
 function batchSetStatus(status) {
-  const list = filteredCards.value.filter(c => selectedIds.value.has(c.id))
+  if (editingInProgress.value) {
+    showToast('请先完成或取消当前编辑再做批量操作', 'error')
+    return
+  }
+  const list = selectableCards.value.filter(c => selectedIds.value.has(c.id))
   if (list.length === 0) return
   list.forEach(c => { c.status = status })
   const opt = STATUS_OPTIONS.find(o => o.value === status)
@@ -368,14 +429,34 @@ function batchSetStatus(status) {
 }
 
 function clearSelection() {
+  if (editingInProgress.value) {
+    showToast('请先完成或取消当前编辑', 'error')
+    return
+  }
   selectedIds.value = new Set()
 }
 
+function setFilter(key, value) {
+  const andThen = () => { filters.value[key] = value }
+  requireSavedOrConfirm(andThen, '修改筛选条件')
+}
+
+function setNightMode(val) {
+  const andThen = () => { nightMode.value = val }
+  requireSavedOrConfirm(andThen, val ? '切换到晚场模式' : '切换回正常模式')
+}
+
 function clearFilters() {
-  filters.value = { session: '', responsible: '', status: '', risk: '' }
+  const andThen = () => { filters.value = { session: '', responsible: '', status: '', risk: '' } }
+  requireSavedOrConfirm(andThen, '清空筛选')
 }
 
 function onDragStart(e, id) {
+  if (editingInProgress.value) {
+    e.preventDefault()
+    showToast('请先完成或取消当前编辑再排序', 'error')
+    return
+  }
   dragId.value = id
   e.dataTransfer.effectAllowed = 'move'
   try { e.dataTransfer.setData('text/plain', id) } catch (_) {}
@@ -386,6 +467,7 @@ function onDragEnd() {
   dragOverPos.value = null
 }
 function onDragOver(e, id) {
+  if (editingInProgress.value) return
   e.preventDefault()
   const el = e.currentTarget
   const rect = el.getBoundingClientRect()
@@ -398,9 +480,8 @@ function onDragOver(e, id) {
 }
 function onDrop(e, targetId) {
   e.preventDefault()
-  if (!dragId.value || dragId.value === targetId) {
-    onDragEnd(); return
-  }
+  if (editingInProgress.value) { onDragEnd(); return }
+  if (!dragId.value || dragId.value === targetId) { onDragEnd(); return }
   const list = [...cards.value].sort((a, b) => a.order - b.order)
   const fromIdx = list.findIndex(c => c.id === dragId.value)
   const toIdx = list.findIndex(c => c.id === targetId)
@@ -424,23 +505,8 @@ function getColorMeta(val) {
 function getStatusMeta(val) {
   return STATUS_OPTIONS.find(s => s.value === val) || STATUS_OPTIONS[0]
 }
-
 function riskLabel(r) {
   return r === 'high' ? '高风险' : r === 'medium' ? '中风险' : '正常'
-}
-
-function confirmLeaveWithoutSave(andThen) {
-  if (hasUnsavedChanges.value) {
-    confirmModal.value = {
-      title: '有未保存的修改',
-      message: '当前编辑内容尚未保存，是否继续？',
-      onSave: () => { saveEdit(); confirmModal.value = null; andThen?.() },
-      onDiscard: () => { cancelEdit(); confirmModal.value = null; andThen?.() },
-      onCancel: () => { confirmModal.value = null }
-    }
-  } else {
-    andThen?.()
-  }
 }
 </script>
 
@@ -454,15 +520,15 @@ function confirmLeaveWithoutSave(andThen) {
       <div class="header-actions">
         <span v-if="hasUnsavedChanges" class="unsaved-flag">⚠ 有未保存的修改</span>
         <div class="mode-switch" :class="{ 'night-active': nightMode }">
-          <button :class="{ active: !nightMode }" @click="nightMode = false">
+          <button :class="{ active: !nightMode }" @click="setNightMode(false)" :disabled="editingInProgress && hasUnsavedChanges && false">
             ☀ 正常模式
           </button>
-          <button :class="{ active: nightMode }" @click="nightMode = true">
+          <button :class="{ active: nightMode }" @click="setNightMode(true)" :disabled="editingInProgress && hasUnsavedChanges && false">
             🌙 晚场核对
           </button>
         </div>
-        <button class="ghost sm" @click="addCard(false)">＋ 新增</button>
-        <button class="primary sm" @click="addCard(true)">＋ 复制上一组新增</button>
+        <button class="ghost sm" @click="addCard(false)" :disabled="editingInProgress">＋ 新增</button>
+        <button class="primary sm" @click="addCard(true)" :disabled="editingInProgress">＋ 复制上一组新增</button>
       </div>
     </header>
 
@@ -477,7 +543,7 @@ function confirmLeaveWithoutSave(andThen) {
       <div class="filter-grid">
         <div>
           <label>所属场次</label>
-          <select v-model="filters.session">
+          <select :value="filters.session" @change="setFilter('session', $event.target.value)">
             <option value="">全部场次</option>
             <option v-for="s in allSessions" :key="s" :value="s">{{ s }}</option>
             <optgroup label="快捷预设">
@@ -487,21 +553,21 @@ function confirmLeaveWithoutSave(andThen) {
         </div>
         <div>
           <label>责任人</label>
-          <select v-model="filters.responsible">
+          <select :value="filters.responsible" @change="setFilter('responsible', $event.target.value)">
             <option value="">全部责任人</option>
             <option v-for="r in allResponsibles" :key="r" :value="r">{{ r }}</option>
           </select>
         </div>
         <div>
           <label>当前状态</label>
-          <select v-model="filters.status">
+          <select :value="filters.status" @change="setFilter('status', $event.target.value)">
             <option value="">全部状态</option>
             <option v-for="s in STATUS_OPTIONS" :key="s.value" :value="s.value">{{ s.label }}</option>
           </select>
         </div>
         <div>
           <label>风险等级</label>
-          <select v-model="filters.risk">
+          <select :value="filters.risk" @change="setFilter('risk', $event.target.value)">
             <option value="">全部等级</option>
             <option value="high">高风险</option>
             <option value="medium">中风险</option>
@@ -528,23 +594,25 @@ function confirmLeaveWithoutSave(andThen) {
       </div>
     </section>
 
-    <section v-if="filteredCards.length > 0" class="batch-bar">
+    <section v-if="selectableCards.length > 0" class="batch-bar">
       <div class="batch-info" style="display:flex;align-items:center;gap:8px;">
         <input type="checkbox" class="card-checkbox"
           :checked="allSelected"
           :indeterminate.prop="someSelected"
+          :disabled="editingInProgress"
           @change="toggleSelectAll" />
         <span>
-          <template v-if="someSelected || allSelected">✓ 已选择 {{ selectedCount }} / {{ filteredCards.length }} 张</template>
+          <template v-if="editingInProgress">（编辑中无法批量操作，请先保存或取消）</template>
+          <template v-else-if="someSelected || allSelected">✓ 已选择 {{ selectedCount }} / {{ selectableCards.length }} 张</template>
           <template v-else>（勾选后可批量操作）</template>
         </span>
       </div>
       <div class="batch-actions">
-        <button class="sm" @click="batchSetStatus('pending')" :disabled="selectedCount === 0">标记待发放</button>
-        <button class="sm success" @click="batchSetStatus('checked')" :disabled="selectedCount === 0">标记已签到</button>
-        <button class="sm" style="background:#fcd34d;color:#92400e;border-color:#f59e0b" @click="batchSetStatus('recovering')" :disabled="selectedCount === 0">标记待回收</button>
-        <button class="sm danger" @click="batchSetStatus('issue')" :disabled="selectedCount === 0">标记异常待核对</button>
-        <button class="sm ghost" @click="clearSelection" v-if="selectedCount > 0">取消选择</button>
+        <button class="sm" @click="batchSetStatus('pending')" :disabled="selectedCount === 0 || editingInProgress">标记待发放</button>
+        <button class="sm success" @click="batchSetStatus('checked')" :disabled="selectedCount === 0 || editingInProgress">标记已签到</button>
+        <button class="sm" style="background:#fcd34d;color:#92400e;border-color:#f59e0b" @click="batchSetStatus('recovering')" :disabled="selectedCount === 0 || editingInProgress">标记待回收</button>
+        <button class="sm danger" @click="batchSetStatus('issue')" :disabled="selectedCount === 0 || editingInProgress">标记异常待核对</button>
+        <button class="sm ghost" @click="clearSelection" v-if="selectedCount > 0" :disabled="editingInProgress">取消选择</button>
       </div>
     </section>
 
@@ -552,36 +620,46 @@ function confirmLeaveWithoutSave(andThen) {
       <div v-if="filteredCards.length === 0" class="empty-state">
         <div class="big-icon">📭</div>
         <h3>{{ cards.length === 0 ? '还没有任何签到卡' : '没有符合筛选条件的记录' }}</h3>
-        <p>{{ cards.length === 0 ? '点击右上角「新增」开始录入第一张卡' : '尝试修改筛选条件，或在晚场模式下切换' }}</p>
+        <p>
+          <template v-if="cards.length === 0">点击右上角「新增」开始录入第一张卡</template>
+          <template v-else-if="editingInProgress">当前有编辑中的卡已钉在顶部，完成或取消后可看到列表</template>
+          <template v-else>尝试修改筛选条件，或切换到晚场模式</template>
+        </p>
       </div>
 
       <div
         v-for="card in filteredCards"
-        :key="card.id"
+        :key="card.id + (card.__pinned ? '-pinned' : '')"
         class="card-item"
         :class="{
-          editing: editingId === card.id,
+          editing: (editingId === card.id) || (isCreating && card.__pinned),
+          'card-pinned': card.__pinned,
           dragging: dragId === card.id,
           'drag-over-top': dragOverId === card.id && dragOverPos === 'top',
           'drag-over-bottom': dragOverId === card.id && dragOverPos === 'bottom',
-          'has-risk-high': getRiskLevel(card) === 'high',
-          'has-risk-medium': getRiskLevel(card) === 'medium',
-          'has-risk-low': getRiskLevel(card) === 'low',
+          'has-risk-high': !card.__pinned && getRiskLevel(card) === 'high',
+          'has-risk-medium': !card.__pinned && getRiskLevel(card) === 'medium',
+          'has-risk-low': !card.__pinned && getRiskLevel(card) === 'low',
           'night-issue': nightMode && (card.status !== 'recovered' || card.status === 'issue')
         }"
-        draggable="true"
+        :draggable="!card.__pinned && !editingInProgress"
         @dragstart="onDragStart($event, card.id)"
         @dragend="onDragEnd"
         @dragover="onDragOver($event, card.id)"
         @drop="onDrop($event, card.id)"
       >
+        <div v-if="card.__pinned" style="padding:6px 14px;background:linear-gradient(90deg,#dbeafe,#eff6ff);font-size:12px;color:#1e40af;font-weight:500;border-bottom:1px solid #bfdbfe">
+          {{ card.__pinnedLabel }}
+        </div>
+
         <div class="card-header">
           <div class="card-head-left">
-            <span class="drag-handle" title="拖拽调整顺序">⋮⋮</span>
+            <span class="drag-handle" :title="card.__pinned ? '新增中：保存后可拖拽排序' : '拖拽调整顺序'">⋮⋮</span>
             <input type="checkbox" class="card-checkbox"
               :checked="selectedIds.has(card.id)"
+              :disabled="card.__pinned || editingInProgress"
               @change="toggleSelect(card.id)" />
-            <span class="card-no" :class="{ duplicate: duplicateCardNos.has(card.id) }" :title="duplicateCardNos.has(card.id) ? '⚠ 卡号重复' : '卡号'">
+            <span class="card-no" :class="{ duplicate: !card.__pinned && duplicateCardNos.has(card.id) }" :title="duplicateCardNos.has(card.id) ? '⚠ 卡号重复' : '卡号'">
               {{ card.cardNo || '(未填)' }}
             </span>
             <span
@@ -590,9 +668,9 @@ function confirmLeaveWithoutSave(andThen) {
               :style="{
                 background: getColorMeta(card.groupColor)?.bg,
                 color: getColorMeta(card.groupColor)?.fg,
-                borderColor: colorConflicts.has(card.id) ? '#ef4444' : 'transparent'
+                borderColor: (!card.__pinned && colorConflicts.has(card.id)) ? '#ef4444' : 'transparent'
               }"
-              :title="colorConflicts.has(card.id) ? '⚠ 同场次颜色冲突' : '分组颜色'"
+              :title="(!card.__pinned && colorConflicts.has(card.id)) ? '⚠ 同场次颜色冲突' : '分组颜色'"
             >
               <span :style="{'display':'inline-block','width':'8px','height':'8px','border-radius':'50%','background':getColorMeta(card.groupColor)?.dot,'margin-right':'4px'}"></span>
               {{ getColorMeta(card.groupColor)?.label }}
@@ -601,33 +679,32 @@ function confirmLeaveWithoutSave(andThen) {
             <span class="status-tag" :class="getStatusMeta(card.status).cls">
               {{ getStatusMeta(card.status).label }}
             </span>
-            <span title="风险等级" style="font-size:12px;color:var(--text-muted)">
+            <span title="风险等级" style="font-size:12px;color:var(--text-muted)" v-if="!card.__pinned">
               <span class="risk-dot" :class="'risk-' + getRiskLevel(card)"></span>
               {{ riskLabel(getRiskLevel(card)) }}
             </span>
           </div>
           <div class="card-head-right">
-            <template v-if="editingId === card.id">
+            <template v-if="(isCreating && card.__pinned) || editingId === card.id">
               <button class="primary sm" @click="saveEdit" :disabled="!hasUnsavedChanges">💾 保存</button>
-              <button class="sm" @click="cancelEdit" v-if="hasUnsavedChanges">取消</button>
-              <button class="sm" @click="cancelEdit" v-else>收起</button>
+              <button class="sm" @click="cancelEdit">{{ hasUnsavedChanges ? '取消' : '收起' }}</button>
             </template>
             <template v-else>
-              <button class="sm" @click="startEdit(card.id)">✏ 编辑</button>
-              <button class="sm ghost" @click="duplicateCard(card.id)">📋 复制分组</button>
-              <button class="sm danger" @click="deleteCard(card.id)">🗑 删除</button>
+              <button class="sm" @click="startEdit(card.id)" :disabled="editingInProgress">✏ 编辑</button>
+              <button class="sm ghost" @click="duplicateCard(card.id)" :disabled="editingInProgress">📋 复制分组</button>
+              <button class="sm danger" @click="deleteCard(card.id)" :disabled="isCreating">🗑 删除</button>
             </template>
           </div>
         </div>
 
         <div class="card-body">
-          <template v-if="editingId === card.id && editingDraft">
+          <template v-if="(isCreating && card.__pinned && editingDraft) || (editingId === card.id && editingDraft)">
             <div class="edit-form">
               <div class="form-group">
                 <label><span class="req">*</span>卡号</label>
                 <input type="text" v-model="editingDraft.cardNo"
                   placeholder="例如 A-001"
-                  :class="{ 'color-conflict': duplicateCardNos.has(card.id) && editingDraft.cardNo }" />
+                  :class="{ 'color-conflict': !card.__pinned && duplicateCardNos.has(card.id) && editingDraft.cardNo }" />
               </div>
               <div class="form-group">
                 <label><span class="req">*</span>所属场次</label>
@@ -663,10 +740,8 @@ function confirmLeaveWithoutSave(andThen) {
                 </select>
               </div>
               <div class="form-group">
-                <label><span class="req" v-if="card.status === 'issue' || card.status === 'recovering'"></span>责任人</label>
-                <input type="text" v-model="editingDraft.responsible"
-                  :class="{ 'color-conflict': !editingDraft.responsible.trim() }"
-                  placeholder="负责人姓名" />
+                <label>责任人 <span style="font-weight:normal;color:var(--text-soft);margin-left:4px">（建议指定，空缺会提高风险等级）</span></label>
+                <input type="text" v-model="editingDraft.responsible" placeholder="负责人姓名（选填，建议填写）" />
               </div>
               <div class="form-group full">
                 <label>缺角 / 破损说明</label>
@@ -720,18 +795,18 @@ function confirmLeaveWithoutSave(andThen) {
             <span v-if="card.recycleNote && card.recycleNote.trim()" class="issue-note recycle-note" :title="card.recycleNote">
               🔄 回收备注：{{ card.recycleNote }}
             </span>
-            <span v-if="duplicateCardNos.has(card.id)" class="issue-note">
+            <span v-if="!card.__pinned && duplicateCardNos.has(card.id)" class="issue-note">
               ⚠ 卡号与其他卡重复
             </span>
-            <span v-if="colorConflicts.has(card.id)" class="issue-note">
+            <span v-if="!card.__pinned && colorConflicts.has(card.id)" class="issue-note">
               ⚠ 同场次颜色冲突
             </span>
           </div>
-          <div class="footer-actions" v-if="editingId !== card.id">
-            <button class="sm" @click="quickSetStatus(card.id, 'pending')" title="标记为待发放">待发放</button>
-            <button class="sm success" @click="quickSetStatus(card.id, 'checked')" title="已签到">已签到</button>
-            <button class="sm" style="background:#fef3c7;color:#92400e;border-color:#f59e0b" @click="quickSetStatus(card.id, 'recovering')" title="待回收">待回收</button>
-            <button class="sm danger" @click="quickSetStatus(card.id, 'issue')" title="异常待核对">异常</button>
+          <div class="footer-actions" v-if="editingId !== card.id && !(isCreating && card.__pinned)">
+            <button class="sm" @click="quickSetStatus(card.id, 'pending')" :disabled="editingInProgress" title="标记为待发放">待发放</button>
+            <button class="sm success" @click="quickSetStatus(card.id, 'checked')" :disabled="editingInProgress" title="已签到">已签到</button>
+            <button class="sm" style="background:#fef3c7;color:#92400e;border-color:#f59e0b" @click="quickSetStatus(card.id, 'recovering')" :disabled="editingInProgress" title="待回收">待回收</button>
+            <button class="sm danger" @click="quickSetStatus(card.id, 'issue')" :disabled="editingInProgress" title="异常待核对">异常</button>
           </div>
         </div>
       </div>
